@@ -1,0 +1,6 @@
+geometry_msgs/Pose2D robot_pose
+geometry_msgs/Point robot_vel
+geometry_msgs/Pose2D[] enemies
+geometry_msgs/Point target_pos
+---
+geometry_msgs/Point action
