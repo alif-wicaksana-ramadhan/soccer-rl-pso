@@ -7,12 +7,16 @@
 #include <std_msgs/msg/float32.hpp>
 #include <chrono>
 #include <thread>
-#include "el_force/el_force.hpp"
+#include <mutex>
+#include <condition_variable>
+#include "sfm/sfm.hpp"
 #include "field_interpreter_interfaces/srv/get_robot_in_radius.hpp"
 #include "rl_module_interfaces/srv/inference.hpp"
+#include "rl_module_interfaces/srv/run_sim.hpp"
 
 enum class SystemState
 {
+  STOP,
   IDLE,
   RUNNING,
   COMPLETED
@@ -22,6 +26,8 @@ class Attacker : public rclcpp::Node
 {
 private:
   SystemState system_state_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
   std::string robot_name_;
   geometry_msgs::msg::Pose2D pose_;
   geometry_msgs::msg::Twist vel_;
@@ -31,7 +37,7 @@ private:
   std_msgs::msg::Int32 sim_state_;
   std::vector<geometry_msgs::msg::Pose2D> defenders_;
 
-  rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr timer_, subroutine_;
   rclcpp::Subscription<geometry_msgs::msg::Pose2D>::SharedPtr pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr vel_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr target_sub_;
@@ -40,10 +46,11 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr sim_start_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr sim_stop_pub_;
+  rclcpp::Service<rl_module_interfaces::srv::RunSim>::SharedPtr run_sim_service_;
   rclcpp::Client<field_interpreter_interfaces::srv::GetRobotInRadius>::SharedPtr robot_client_;
   rclcpp::Client<rl_module_interfaces::srv::Inference>::SharedPtr rl_client_;
 
-  ElForce el_force_;
+  SFM sfm_;
 
   void pose_callback_(const geometry_msgs::msg::Pose2D::SharedPtr msg)
   {
@@ -91,21 +98,38 @@ private:
     request->position.y = pose_.y;
     request->position.theta = pose_.theta;
 
-    // Define a callback function that will be called when the service response is received
-    using ServiceResponseFuture = rclcpp::Client<field_interpreter_interfaces::srv::GetRobotInRadius>::SharedFuture;
-    auto response_received_callback = [this](ServiceResponseFuture future)
+    while (!robot_client_->wait_for_service(std::chrono::seconds(1)))
     {
-      auto response = future.get();
+      RCLCPP_INFO(this->get_logger(), "Waiting for server...");
+    }
+
+    auto result = robot_client_->async_send_request(request);
+    if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), result) == rclcpp::FutureReturnCode::SUCCESS)
+    {
+      auto response = result.get();
       defenders_.clear();
       for (const auto &pos : response->points)
       {
-        // RCLCPP_INFO(this->get_logger(), "Position: x=%.2f, y=%.2f, theta=%.2f", pos.x, pos.y, pos.theta);
+        RCLCPP_INFO(this->get_logger(), "Position: x=%.2f, y=%.2f, theta=%.2f", pos.x, pos.y, pos.theta);
         defenders_.push_back(pos);
       }
-    };
+    }
 
-    // Send the request asynchronously and set the callback to handle the response
-    auto future_result = robot_client_->async_send_request(request, response_received_callback);
+    // // Define a callback function that will be called when the service response is received
+    // using ServiceResponseFuture = rclcpp::Client<field_interpreter_interfaces::srv::GetRobotInRadius>::SharedFuture;
+    // auto response_received_callback = [this](ServiceResponseFuture future)
+    // {
+    //   auto response = future.get();
+    //   defenders_.clear();
+    //   for (const auto &pos : response->points)
+    //   {
+    //     // RCLCPP_INFO(this->get_logger(), "Position: x=%.2f, y=%.2f, theta=%.2f", pos.x, pos.y, pos.theta);
+    //     defenders_.push_back(pos);
+    //   }
+    // };
+
+    // // Send the request asynchronously and set the callback to handle the response
+    // auto future_result = robot_client_->async_send_request(request, response_received_callback);
   }
 
   void rl_inference_reqeust()
@@ -120,58 +144,92 @@ private:
     request->enemies = defenders_;
     request->robot_vel = vel_msg;
 
-    // Define a callback function that will be called when the service response is received
-    using ServiceResponseFuture = rclcpp::Client<rl_module_interfaces::srv::Inference>::SharedFuture;
-    auto response_received_callback = [this](ServiceResponseFuture future)
+    while (!rl_client_->wait_for_service(std::chrono::seconds(1)))
     {
-      auto response = future.get();
-      rl_action_ = response->action;
-    };
+      RCLCPP_INFO(this->get_logger(), "Waiting for server...");
+    }
 
-    // Send the request asynchronously and set the callback to handle the response
-    auto future_result = rl_client_->async_send_request(request, response_received_callback);
+    auto result = rl_client_->async_send_request(request);
+    if (rclcpp::spin_until_future_complete(this->get_node_base_interface(), result) == rclcpp::FutureReturnCode::SUCCESS)
+    {
+      rl_action_ = result.get()->action;
+    }
+
+    // // Define a callback function that will be called when the service response is received
+    // using ServiceResponseFuture = rclcpp::Client<rl_module_interfaces::srv::Inference>::SharedFuture;
+    // auto response_received_callback = [this](ServiceResponseFuture future)
+    // {
+    //   auto response = future.get();
+    //   rl_action_ = response->action;
+    // };
+
+    // // Send the request asynchronously and set the callback to handle the response
+    // auto future_result = rl_client_->async_send_request(request, response_received_callback);
+  }
+
+  void start_once_(const rl_module_interfaces::srv::RunSim::Request::SharedPtr request, const rl_module_interfaces::srv::RunSim::Response::SharedPtr response)
+  {
+    std_msgs::msg::Float32 reward;
+    std::cout << "REQUEST CALLED" << " " << request->data.data << std::endl;
+
+    if (request->data.data)
+    {
+      running_loop_();
+      reward.data = 1.0;
+      response->reward = reward;
+    }
+
+    std::cout << "COMPLETED" << std::endl;
   }
 
   void running_loop_()
   {
-    geometry_msgs::msg::Twist msg;
-    rl_inference_reqeust();
-    get_robots_request(10.0);
-    RCLCPP_INFO(this->get_logger(), "Detected Enemy: %ld", defenders_.size());
-    for (const geometry_msgs::msg::Pose2D defender : defenders_)
+    while (rclcpp::ok())
     {
-      RCLCPP_INFO(this->get_logger(), "Position: x=%.2f, y=%.2f, theta=%.2f", defender.x, defender.y, defender.theta);
-      std::vector<double> enemyPos = {defender.x, defender.y};
-      el_force_.addEnemy(enemyPos);
-    }
-
-    std::vector<double> target_pos = {target_.x, target_.y, target_.z};
-    std::vector<double> pos = {pose_.x, pose_.y, pose_.theta};
-    el_force_.setTarget(target_pos);
-    std::vector<double> forceVec = el_force_.calculateForce(pos);
-
-    forceVec[0] *= rl_action_.x;
-    forceVec[1] *= rl_action_.y;
-    rl_action_.x = 0.0;
-    rl_action_.y = 0.0;
-
-    for (int i = 0; i < (int)forceVec.size(); i++)
-    {
-      if (forceVec[i] > 100.0)
+      geometry_msgs::msg::Twist msg;
+      get_robots_request(10.0);
+      rl_inference_reqeust();
+      RCLCPP_INFO(this->get_logger(), "Detected Enemy: %ld", defenders_.size());
+      for (const geometry_msgs::msg::Pose2D defender : defenders_)
       {
-        forceVec[i] = 100.0;
+        // RCLCPP_INFO(this->get_logger(), "Position: x=%.2f, y=%.2f, theta=%.2f", defender.x, defender.y, defender.theta);
+        std::array<double, 2> enemyPos = {defender.x, defender.y};
+        sfm_.addDynamicObject(enemyPos);
       }
-      else if (forceVec[i] < -100.0)
+
+      std::array<double, 2> target_pos = {target_.x, target_.y};
+      std::array<double, 2> robotPos = {pose_.x, pose_.y};
+      std::array<double, 2> robotVel = {vel_.linear.x, vel_.linear.y};
+      std::array<double, 2> forceVec = {0.0, 0.0};
+
+      sfm_.setTargetPosition(target_pos);
+      forceVec = sfm_.calculateForce(robotPos, robotVel);
+
+      forceVec[0] *= rl_action_.x;
+      forceVec[1] *= rl_action_.y;
+      rl_action_.x = 0.0;
+      rl_action_.y = 0.0;
+
+      for (int i = 0; i < (int)forceVec.size(); i++)
       {
-        forceVec[i] = -100.0;
+        if (forceVec[i] > 100.0)
+        {
+          forceVec[i] = 100.0;
+        }
+        else if (forceVec[i] < -100.0)
+        {
+          forceVec[i] = -100.0;
+        }
       }
+
+      msg.linear.x = forceVec[0];
+      msg.linear.y = forceVec[1];
+      msg.linear.z = forceVec[2];
+
+      cmd_vel_pub_->publish(msg);
+
+      rclcpp::spin_some(shared_from_this());
     }
-
-    msg.linear.x = forceVec[0];
-    msg.linear.y = forceVec[1];
-    msg.linear.z = forceVec[2];
-
-    cmd_vel_pub_->publish(msg);
 
     // RCLCPP_INFO(this->get_logger(), "Target pos: %f, %f, %f", target_.x, target_.y, target_.z);
     // RCLCPP_INFO(this->get_logger(), "Robot pos: %f, %f, %f", pose_.x, pose_.y, pose_.theta);
@@ -181,50 +239,57 @@ private:
 
   void main_loop_()
   {
-    std_msgs::msg::Bool sim_msg;
-    std::vector<double> targetVec = {target_.x - pose_.x, target_.y - pose_.y};
-    std::cout << sim_state_.data << std::endl;
-
-    switch (system_state_)
+    while (rclcpp::ok())
     {
+      // std_msgs::msg::Bool sim_msg;
+      // std::vector<double> targetVec = {target_.x - pose_.x, target_.y - pose_.y};
+      std::cout << sim_state_.data << std::endl;
 
-    case SystemState::IDLE:
-      RCLCPP_INFO(this->get_logger(), "IDLE");
-      sim_start_pub_->publish(sim_msg);
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      if (sim_state_.data)
-      {
-        system_state_ = SystemState::RUNNING;
-      }
-      break;
+      // switch (system_state_)
+      // {
 
-    case SystemState::RUNNING:
-      RCLCPP_INFO(this->get_logger(), "RUNNING");
-      running_loop_();
+      // case SystemState::STOP:
+      //   break;
 
-      if (calculateNorm(targetVec) < 1.0)
-      {
-        system_state_ = SystemState::COMPLETED;
-      }
-      else if (sim_time_.data > 30.0)
-      {
-        system_state_ = SystemState::COMPLETED;
-      }
-      break;
+      // case SystemState::IDLE:
+      //   RCLCPP_INFO(this->get_logger(), "IDLE");
+      //   sim_start_pub_->publish(sim_msg);
+      //   std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      //   if (sim_state_.data)
+      //   {
+      //     system_state_ = SystemState::RUNNING;
+      //   }
+      //   break;
 
-    case SystemState::COMPLETED:
-      RCLCPP_INFO(this->get_logger(), "COMPLETED");
-      sim_stop_pub_->publish(sim_msg);
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      if (!sim_state_.data)
-      {
-        system_state_ = SystemState::IDLE;
-      }
+      // case SystemState::RUNNING:
+      //   RCLCPP_INFO(this->get_logger(), "RUNNING");
+      //   running_loop_();
+
+      //   if (calculateNorm(targetVec) < 1.0)
+      //   {
+      //     system_state_ = SystemState::COMPLETED;
+      //   }
+      //   else if (sim_time_.data > 30.0)
+      //   {
+      //     system_state_ = SystemState::COMPLETED;
+      //   }
+      //   break;
+
+      // case SystemState::COMPLETED:
+      //   RCLCPP_INFO(this->get_logger(), "COMPLETED");
+      //   sim_stop_pub_->publish(sim_msg);
+      //   std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      //   if (!sim_state_.data)
+      //   {
+      //     system_state_ = SystemState::STOP;
+      //   }
+      // }
+      rclcpp::spin_some(shared_from_this());
     }
   }
 
 public:
-  Attacker(const std::string &robot_name) : Node("attacker"), robot_name_(robot_name), el_force_(5.0, 10.0, 2.0, 70.0)
+  Attacker(const std::string &robot_name) : Node("attacker"), robot_name_(robot_name), sfm_(1.0, 10.0, 30.0, 1.0)
   {
     std::string cmd_vel_topic_ = "/" + robot_name_ + "/cmd_vel";
     std::string pose_topic_ = "/" + robot_name_ + "/pose";
@@ -242,10 +307,13 @@ public:
     vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(vel_topic_, 10, std::bind(&Attacker::vel_callback_, this, std::placeholders::_1));
     target_sub_ = this->create_subscription<geometry_msgs::msg::Point>("/target", 10, std::bind(&Attacker::target_callback_, this, std::placeholders::_1));
     sim_time_sub_ = this->create_subscription<std_msgs::msg::Float32>("/simulationTime", 10, std::bind(&Attacker::sim_time_callback_, this, std::placeholders::_1));
+    run_sim_service_ = this->create_service<rl_module_interfaces::srv::RunSim>("run_sim/start", std::bind(&Attacker::start_once_, this, std::placeholders::_1, std::placeholders::_2));
     robot_client_ = this->create_client<field_interpreter_interfaces::srv::GetRobotInRadius>("get_defender_in_radius");
-    rl_client_ = this->create_client<rl_module_interfaces::srv::Inference>("rl_module");
+    rl_client_ = this->create_client<rl_module_interfaces::srv::Inference>("rl_module/feed_forward");
 
-    timer_ = this->create_wall_timer(std::chrono::milliseconds(100), std::bind(&Attacker::main_loop_, this));
+    main_loop_();
+
+    // timer_ = this->create_wall_timer(std::chrono::milliseconds(100), std::bind(&Attacker::main_loop_, this));
   }
 };
 
@@ -260,9 +328,10 @@ int main(int argc, char **argv)
 
   std::string robot_name = argv[1];
   auto node = std::make_shared<Attacker>(robot_name);
-  rclcpp::executors::SingleThreadedExecutor executor;
-  executor.add_node(node);
-  executor.spin();
+  // rclcpp::spin(node);
+  // rclcpp::executors::SingleThreadedExecutor executor;
+  // executor.add_node(node);
+  // executor.spin();
 
   // rclcpp::spin(std::make_shared<Attacker>(robot_name));
   rclcpp::shutdown();

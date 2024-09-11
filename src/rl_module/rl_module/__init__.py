@@ -1,2 +1,2 @@
 from .replay_memory import ReplayMemory
-from .model import QNetwork
+from .model import SoccerObserverModel

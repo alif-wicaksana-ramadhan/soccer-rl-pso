@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'rl_module_train = rl_module.rl_module:main'
+            'rl_module = rl_module.rl_module:main',
+            'model_trainer = rl_module.model_trainer:main'
         ],
     },
 )

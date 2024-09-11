@@ -39,16 +39,16 @@ class SoccerObserverModel(nn.Module):
     def __init__(self, field_size=np.array([9.0, 6.0], np.float32)):
         super(SoccerObserverModel, self).__init__()
         self.field_size = field_size
-        self.robot_pos_fc = nn.Linear(2, 64)
-        self.robot_vel_fc = nn.Linear(2, 64)
-        self.goal_fc = nn.Linear(2, 64)
-        self.enemies_fc = nn.Linear(2, 64)
+        self.robot_pos_fc = nn.Linear(2, 32)
+        self.robot_vel_fc = nn.Linear(2, 32)
+        self.goal_fc = nn.Linear(2, 32)
+        self.enemies_fc = nn.Linear(2, 32)
 
-        self.aggregation_fc = nn.Linear(64, 64)
+        self.aggregation_fc = nn.Linear(32, 32)
 
-        self.fc1 = nn.Linear(4 * 64, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, 2)
+        self.fc1 = nn.Linear(4 * 32, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 2)
 
     def forward(self, robot_position, robot_velocity, goal_position, enemies_positions):
         robot_position = torch.from_numpy(robot_position/self.field_size)
@@ -71,6 +71,38 @@ class SoccerObserverModel(nn.Module):
         action = self.fc3(x)
 
         return action
+
+    def load_model(self, model_file):
+        # Load pre-trained model from a file
+        return self.net.load_state_dict(torch.load(model_file))
+
+    def load_model_weights(self, weight_file):
+        # Load pre-trained model weights from a file
+        return self.net.load_state_dict(torch.load(weight_file))
+
+    def save_model(self, model_file):
+        # Save the entire model to a file
+        torch.save(self.state_dict(), model_file)
+    
+    def save_model_weights(self, weight_file):
+        # Save only the model weights to a file
+        torch.save(self.state_dict(), weight_file)
+    
+    def get_all_parameters(self):
+        # Flatten and concatenate all parameters into a single one-dimensional array
+        all_params = []
+        for param in self.parameters():
+            all_params.append(param.detach().cpu().numpy().flatten())
+        return np.concatenate(all_params)
+
+    def update_all_parameters(self, new_weights):
+        # Update model parameters with new weights from a one-dimensional array
+        pointer = 0
+        for param in self.parameters():
+            param_size = param.numel()
+            param_data = torch.tensor(new_weights[pointer:pointer + param_size], dtype=param.dtype, device=param.device).reshape(param.shape)
+            param.data = param_data
+            pointer += param_size
     
 
 class QNetwork:

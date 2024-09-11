@@ -11,6 +11,7 @@
 
   <depend>rclcpp</depend>
   <depend>geometry_msgs</depend>
+  <depend>sfm</depend>
   <depend>el_force</depend>
   <depend>field_interpreter_interfaces</depend>
   <depend>rl_module_interfaces</depend>
